@@ -50,7 +50,7 @@ If that version is supported by hiedb, it runs the function @f@ with the @db@.
 Otherwise it throws 'IncompatibleSchemaVersion' exception.
 -}
 checkVersion :: (HieDb -> IO a) -> HieDb -> IO a
-checkVersion k db@(getConn -> conn) = do
+checkVersion k db@(getConnection -> conn) = do
   execute_ conn "PRAGMA busy_timeout = 500;"
   execute_ conn "PRAGMA journal_mode = WAL;"
   [Only ver] <- query_ conn "PRAGMA user_version"
@@ -62,14 +62,13 @@ checkVersion k db@(getConn -> conn) = do
   else
     throwIO $ IncompatibleSchemaVersion dB_VERSION ver
 
-withHieDb' :: FilePath -> ContT a IO HieDb
-withHieDb' fp = do
-  connection <- ContT $ withConnection fp
-  liftIO $ setupHieDb connection
-  let createStatement t = fmap StatementFor (ContT (withStatement connection t))
+withPreparedHieDb :: HieDb -> (HieDb -> IO a) -> IO a
+withPreparedHieDb hiedb act = do
+  let connection = getConnection hiedb
       deleteInternalTables = do
-        deletions
-          <- traverse createStatement
+        deletions <-
+          traverse
+            (ContT . withStatement connection)
             [ "DELETE FROM refs  WHERE hieFile = ?"
             , "DELETE FROM decls WHERE hieFile = ?"
             , "DELETE FROM defs  WHERE hieFile = ?"
@@ -77,22 +76,42 @@ withHieDb' fp = do
             , "DELETE FROM mods  WHERE hieFile = ?"
             , "DELETE FROM exports WHERE hieFile = ?"
             ]
-        pure $ \fp -> mapM_ (`runStatementFor_` fp) deletions
-  HieDb connection
-    <$> createStatement "INSERT INTO mods VALUES (?,?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO refs VALUES (?,?,?,?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO decls VALUES (?,?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO imports VALUES (?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO defs VALUES (?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO exports VALUES (?,?,?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO typerefs VALUES (?,?,?,?,?,?,?)"
-    <*> createStatement "INSERT INTO typenames(name,mod,unit) VALUES (?,?,?)"
-    <*> createStatement "SELECT id FROM typenames WHERE name = ? AND mod = ? AND unit = ?"
-    <*> deleteInternalTables
+
+        pure $ foldMap preparedStatementFor_ deletions
+
+  setupHieDb connection
+  flip runContT act $ do
+    modsStatement <- ContT $ withStatement connection "INSERT INTO mods VALUES (?,?,?,?,?,?,?)"
+    refsStatement <- ContT $ withStatement connection "INSERT INTO refs VALUES (?,?,?,?,?,?,?,?,?)"
+    declsStatement <- ContT $ withStatement connection "INSERT INTO decls VALUES (?,?,?,?,?,?,?)"
+    importsStatement <- ContT $ withStatement connection "INSERT INTO imports VALUES (?,?,?,?,?,?)"
+    defsStatement <- ContT $ withStatement connection "INSERT INTO defs VALUES (?,?,?,?,?,?)"
+    exportsStatement <- ContT $ withStatement connection "INSERT INTO exports VALUES (?,?,?,?,?,?,?,?)"
+    typerefsStatement <- ContT $ withStatement connection "INSERT INTO typerefs VALUES (?,?,?,?,?,?,?)"
+    typenamesStatement <- ContT $ withStatement connection "INSERT INTO typenames(name,mod,unit) VALUES (?,?,?)"
+    typenamesSelectStatement <- ContT $ withStatement connection "SELECT id FROM typenames WHERE name = ? AND mod = ? AND unit = ?"
+    Prepared (getConnection hiedb)
+      . PreparedHieDb
+        (preparedStatementFor_ modsStatement)
+        (preparedStatementFor_ refsStatement)
+        (preparedStatementFor_ declsStatement)
+        (preparedStatementFor_ importsStatement)
+        (preparedStatementFor_ defsStatement)
+        (preparedStatementFor_ exportsStatement)
+        (preparedStatementFor_ typerefsStatement)
+        (preparedStatementFor_ typenamesStatement)
+        (preparedStatementFor typenamesSelectStatement)
+      <$> deleteInternalTables
+
+
+withHieDb' :: FilePath -> (HieDb -> IO a) -> IO a
+withHieDb' fp act = do
+  withConnection fp $ \connection -> do
+    act $ PreInitialized connection
 
 {-| Given path to @.hiedb@ file, constructs 'HieDb' and passes it to given function. -}
 withHieDb :: FilePath -> (HieDb -> IO a) -> IO a
-withHieDb fp f = runContT (withHieDb' fp) $ \hiedb -> do
+withHieDb fp f = withHieDb' fp $ \hiedb -> do
   checkVersion f hiedb
 
 {-| Given GHC LibDir and path to @.hiedb@ file,
@@ -100,7 +119,7 @@ constructs DynFlags (required for printing info from @.hie@ files)
 and 'HieDb' and passes them to given function.
 -}
 withHieDbAndFlags :: LibDir -> FilePath -> (DynFlags -> HieDb -> IO a) -> IO a
-withHieDbAndFlags libdir fp f = runContT (withHieDb' fp) $ \hiedb -> do
+withHieDbAndFlags libdir fp f = withHieDb' fp $ \hiedb -> do
   dynFlags <- dynFlagsForPrinting libdir
   f dynFlags hiedb
 
@@ -108,7 +127,7 @@ withHieDbAndFlags libdir fp f = runContT (withHieDb' fp) $ \hiedb -> do
 -}
 initConn :: HieDb -> IO ()
 {-# DEPRECATED initConn "Use setupHieDb instead." #-}
-initConn = setupHieDb . getConn
+initConn = setupHieDb . getConnection
 
 {-| Initialize database schema for given 'HieDb'.
 -}
@@ -238,8 +257,8 @@ addArr hiedb arr = do
         let occ = nameOccName n
             mod = moduleName m
             uid = moduleUnit m
-        runStatementFor_ (insertTypenamesStatement hiedb) (occ,mod,uid)
-        fmap fromOnly <$> runStatementFor (queryTypenamesStatement hiedb) (occ,mod,uid)
+        runStatementFor (getStatement hiedb insertTypenamesStatement) (occ,mod,uid)
+        fmap fromOnly <$> runStatementFor (getStatement hiedb queryTypenamesStatement) (occ,mod,uid)
 
 {-| Add references to types from given @.hie@ file to DB. -}
 addTypeRefs
@@ -296,7 +315,7 @@ The indexing is skipped if the file was not modified since the last time it was 
 The boolean returned is true if the file was actually indexed
 -}
 addRefsFrom :: (MonadIO m, NameCacheMonad m) => HieDb -> Maybe FilePath -> SkipOptions -> FilePath ->  m Bool
-addRefsFrom c@(getConn -> conn) mSrcBaseDir skipOptions path = do
+addRefsFrom c@(getConnection -> conn) mSrcBaseDir skipOptions path = do
   hash <- liftIO $ getFileHash path
   mods <- liftIO $ query conn "SELECT * FROM mods WHERE hieFile = ? AND hash = ?" (path, hash)
   case mods of
@@ -343,9 +362,9 @@ addRefsFromLoadedInternal
   -> HieFile -- ^ Data loaded from the @.hie@ file
   -> m ()
 addRefsFromLoadedInternal
-  db@(getConn -> conn) path sourceFile hash skipOptions hf =
+  db@(getConnection -> conn) path sourceFile hash skipOptions hf =
     liftIO $ withTransaction conn $ do
-      deleteInternalTablesStatement db (Only path)
+      runStatementFor (getStatement db deleteInternalTablesStatement) (Only path)
       addRefsFromLoaded_unsafe db path sourceFile hash skipOptions hf
 
 -- | Like 'addRefsFromLoaded' but without:
@@ -388,25 +407,25 @@ addRefsFromLoaded_unsafe
         let sourceOnlyNodeInfo = SourcedNodeInfo $ M.delete originToDrop sniMap
         in Node sourceOnlyNodeInfo sp (map (dropNodeInfos originToDrop) children)
 
-  runStatementFor_ (insertModsStatement db) modrow
+  runStatementFor (getStatement db insertModsStatement) modrow
 
   let AstInfo refsSrc declsSrc importsSrc = genAstInfo path smod SourceInfo refmapSourceOnly
       AstInfo refsGen declsGen importsGen = genAstInfo path smod GeneratedInfo refmapGeneratedOnly
 
   unless (skipRefs skipOptions) $
-    mapM_ (runStatementFor_ (insertRefsStatement db)) (refsSrc <> refsGen)
+    mapM_ (runStatementFor (getStatement db insertRefsStatement)) (refsSrc <> refsGen)
   unless (skipDecls skipOptions) $
-    mapM_ (runStatementFor_ (insertDeclsStatement db)) (declsSrc <> declsGen)
+    mapM_ (runStatementFor (getStatement db insertDeclsStatement)) (declsSrc <> declsGen)
   unless (skipImports skipOptions) $
-    mapM_ (runStatementFor_ (insertImportsStatement db)) (importsSrc <> importsGen)
+    mapM_ (runStatementFor (getStatement db insertImportsStatement)) (importsSrc <> importsGen)
 
   let defs = genDefRow path smod refmapAll
   unless (skipDefs skipOptions) $
-    mapM_ (runStatementFor_ (insertDefsStatement db)) defs
+    mapM_ (runStatementFor (getStatement db insertDefsStatement)) defs
 
   let exports = generateExports path $ hie_exports hf
   unless (skipExports skipOptions) $
-    mapM_ (runStatementFor_ (insertExportsStatement db)) exports
+    mapM_ (runStatementFor (getStatement db insertExportsStatement)) exports
 
   unless (skipTypes skipOptions) $ do
     ixs <- addArr db (hie_types hf)
@@ -422,7 +441,7 @@ addSrcFile
   -> FilePath -- ^ Path to .hs file to be added to DB
   -> Bool -- ^ Is this a real source file? I.e. does it come from user's project (as opposed to from project's dependency)?
   -> IO ()
-addSrcFile (getConn -> conn) hie srcFile isReal =
+addSrcFile (getConnection -> conn) hie srcFile isReal =
   execute conn "UPDATE mods SET hs_src = ? , is_real = ? WHERE hieFile = ?" (srcFile, isReal, hie)
 
 {-| Remove the path to .hs source for all dependency @.hie@ files. Useful for resetting
@@ -431,32 +450,32 @@ the indexed dependencies if the sources have been deleted for some reason.
 removeDependencySrcFiles
   :: HieDb
   -> IO ()
-removeDependencySrcFiles (getConn -> conn) =
+removeDependencySrcFiles (getConnection -> conn) =
   execute conn "UPDATE mods SET hs_src = NULL WHERE NOT is_real" ()
 
 {-| Delete all occurrences of given @.hie@ file from the database -}
 deleteFileFromIndex :: HieDb -> FilePath -> IO ()
-deleteFileFromIndex db@(getConn -> conn) path = withTransaction conn $ do
-  deleteInternalTablesStatement db (Only path)
+deleteFileFromIndex db@(getConnection -> conn) path = withTransaction conn $ do
+  runStatementFor (getStatement db deleteInternalTablesStatement) (Only path)
 
 {-| Delete all entries associated with modules for which the 'modInfoSrcFile' doesn't exist
 on the disk.
 Doesn't delete it if there is no associated 'modInfoSrcFile'
 -}
 deleteMissingRealFiles :: HieDb -> IO ()
-deleteMissingRealFiles db@(getConn -> conn) = withTransaction conn $ do
+deleteMissingRealFiles db@(getConnection -> conn) = withTransaction conn $ do
   missing_file_keys <- fold_ conn "SELECT hieFile,hs_src FROM mods WHERE hs_src IS NOT NULL AND is_real" [] $
     \acc (path,src) -> do
       exists <- doesFileExist src
       pure $ if exists then acc else path : acc
   forM_ missing_file_keys $ \path -> do
-    deleteInternalTablesStatement db (Only path)
+    runStatementFor (getStatement db deleteInternalTablesStatement) (Only path)
 
 {-| Garbage collect typenames with no references - it is a good idea to call
 this function after a sequence of database updates (inserts or deletes)
 -}
 garbageCollectTypeNames :: HieDb -> IO Int
-garbageCollectTypeNames (getConn -> conn) = do
+garbageCollectTypeNames (getConnection -> conn) = do
   execute_ conn "DELETE FROM typenames WHERE NOT EXISTS ( SELECT 1 FROM typerefs WHERE typerefs.id = typenames.id LIMIT 1 )"
   execute_ conn "PRAGMA optimize;"
   changes conn

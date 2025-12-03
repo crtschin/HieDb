@@ -8,6 +8,7 @@
 {-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE DerivingStrategies #-}
 module HieDb.Types where
 
 import Prelude hiding (mod)
@@ -34,36 +35,51 @@ import qualified Text.ParserCombinators.ReadP as R
 import HieDb.Compat
 import Control.Monad (void)
 
-data HieDb = HieDb
-  { getConn :: !Connection
-  , insertModsStatement :: !(StatementFor HieModuleRow)
-  , insertRefsStatement :: !(StatementFor RefRow)
-  , insertDeclsStatement :: !(StatementFor DeclRow)
-  , insertImportsStatement :: !(StatementFor ImportRow)
-  , insertDefsStatement :: !(StatementFor DefRow)
-  , insertExportsStatement :: !(StatementFor ExportRow)
-  , insertTyperefsStatement :: !(StatementFor TypeRef)
-  , insertTypenamesStatement :: !(StatementFor (OccName, ModuleName, Unit))
-  , queryTypenamesStatement :: !(StatementFor (OccName, ModuleName, Unit))
-  , deleteInternalTablesStatement :: !(Only FilePath -> IO ())
+data HieDb
+  = PreInitialized Connection
+  | Prepared Connection PreparedHieDb
+
+data PreparedHieDb = PreparedHieDb
+  { insertModsStatement :: StatementFor_ HieModuleRow
+  , insertRefsStatement :: StatementFor_ RefRow
+  , insertDeclsStatement :: StatementFor_ DeclRow
+  , insertImportsStatement :: StatementFor_ ImportRow
+  , insertDefsStatement :: StatementFor_ DefRow
+  , insertExportsStatement :: StatementFor_ ExportRow
+  , insertTyperefsStatement :: StatementFor_ TypeRef
+  , insertTypenamesStatement :: StatementFor_ (OccName, ModuleName, Unit)
+  , queryTypenamesStatement :: StatementFor (OccName, ModuleName, Unit) (Maybe (Only Int64))
+  , deleteInternalTablesStatement :: StatementFor_ (Only FilePath)
   }
 
-newtype StatementFor a = StatementFor Statement
+getConnection :: HieDb -> Connection
+getConnection hiedb = case hiedb of
+  PreInitialized c -> c
+  Prepared c _ -> c
+
+getStatement :: HieDb -> (PreparedHieDb -> StatementFor a b) -> StatementFor a b
+getStatement hiedb f = case hiedb of
+  PreInitialized _ -> error "hiedb has not been prepared."
+  Prepared _ s -> f s
+
+type StatementFor_ a = StatementFor a ()
+newtype StatementFor a b = StatementFor { runStatementFor :: a -> IO b }
+  deriving newtype (Semigroup, Monoid)
 
 data NoOutput = NoOutput
 
 instance FromRow NoOutput where
   fromRow = pure NoOutput
 
-runStatementFor_ :: ToRow a => StatementFor a -> a -> IO ()
-{-# INLINE runStatementFor_ #-}
-runStatementFor_ (StatementFor statement) params = do
+preparedStatementFor_ :: ToRow a => Statement -> StatementFor_ a
+{-# INLINE preparedStatementFor_ #-}
+preparedStatementFor_ statement = StatementFor $ \params ->
   withBind statement params $
     void (nextRow @NoOutput statement)
 
-runStatementFor :: (ToRow a, FromRow b) => StatementFor a -> a -> IO (Maybe b)
-{-# INLINE runStatementFor #-}
-runStatementFor (StatementFor statement) params = do
+preparedStatementFor :: (ToRow a, FromRow b) => Statement -> StatementFor a (Maybe b)
+{-# INLINE preparedStatementFor #-}
+preparedStatementFor statement = StatementFor $ \params ->
   withBind statement params $
     nextRow statement
 
@@ -75,7 +91,7 @@ data HieDbException
 instance Exception HieDbException where
 
 setHieTrace :: HieDb -> Maybe (T.Text -> IO ()) -> IO ()
-setHieTrace = setTrace . getConn
+setHieTrace = setTrace . getConnection
 
 -- | Encodes the original haskell source file of a module, along with whether
 -- it is "real" or not

@@ -277,25 +277,26 @@ runCommand libdir opts cmd = withHieDbAndFlags libdir (database opts) $ \dynFlag
   when (trace opts) $
     setHieTrace conn (Just $ T.hPutStrLn stderr . ("\n****TRACE: "<>))
   when (reindex opts) $ do
-    files' <- map hieModuleHieFile <$> getAllIndexedMods conn
-    files <- fmap catMaybes $ forM files' $ \f -> do
-      exists <- doesFileExist f
-      if exists
-      then pure $ Just f
-      else do
-        unless (keepMissing opts) $
-          deleteFileFromIndex conn f
-        pure Nothing
-    let n = length files
-        orig = length files'
-    unless (quiet opts) $
-      hPutStrLn stderr $ "Re-indexing " ++ show n ++ " files, deleting " ++ show (n-orig) ++ " files"
-    doIndex conn opts stderr files
+    withPreparedHieDb conn $ \hiedb -> do
+      files' <- map hieModuleHieFile <$> getAllIndexedMods hiedb
+      files <- fmap catMaybes $ forM files' $ \f -> do
+        exists <- doesFileExist f
+        if exists
+        then pure $ Just f
+        else do
+          unless (keepMissing opts) $
+            deleteFileFromIndex hiedb f
+          pure Nothing
+      let n = length files
+          orig = length files'
+      unless (quiet opts) $
+        hPutStrLn stderr $ "Re-indexing " ++ show n ++ " files, deleting " ++ show (n-orig) ++ " files"
+      doIndex hiedb opts stderr files
   case cmd of
-    Init -> pure ()
+    Init -> setupHieDb (getConnection conn)
     Index dirs -> do
       files <- concat <$> mapM getHieFilesIn dirs
-      doIndex conn opts stderr files
+      withPreparedHieDb conn $ \hiedb -> doIndex hiedb opts stderr files
     TypeRefs typ mn muid -> do
       let occ = mkOccName tcClsName typ
       refs <- findReferences conn False occ mn muid []

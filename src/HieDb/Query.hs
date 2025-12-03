@@ -38,20 +38,20 @@ import qualified HieDb.Html as Html
 
 {-| List all modules indexed in HieDb. -}
 getAllIndexedMods :: HieDb -> IO [HieModuleRow]
-getAllIndexedMods (getConn -> conn) = query_ conn "SELECT * FROM mods"
+getAllIndexedMods (getConnection -> conn) = query_ conn "SELECT * FROM mods"
 
 {-| List all module exports -}
 getAllIndexedExports :: HieDb -> IO [ExportRow]
-getAllIndexedExports (getConn -> conn) = query_ conn "SELECT * FROM exports"
+getAllIndexedExports (getConnection -> conn) = query_ conn "SELECT * FROM exports"
 
 {-| List all exports of the given module -}
 getExportsForModule :: HieDb -> ModuleName -> IO [ExportRow]
-getExportsForModule (getConn -> conn) mn =
+getExportsForModule (getConnection -> conn) mn =
   query conn "SELECT exports.* FROM exports JOIN mods USING (hieFile) WHERE mods.mod = ?" (Only mn)
 
 {-| Find all the modules that export an identifier |-}
 findExporters :: HieDb -> OccName -> ModuleName -> Unit -> IO [ModuleName]
-findExporters (getConn -> conn) occ mn unit =
+findExporters (getConnection -> conn) occ mn unit =
   query conn "SELECT mods.mod FROM exports JOIN mods USING (hieFile) WHERE occ = ? AND mod = ? AND unit = ?" (occ, mn, unit)
 
 {-| Lookup Unit associated with given ModuleName.
@@ -59,7 +59,7 @@ HieDbErr is returned if no module with given name has been indexed
 or if ModuleName is ambiguous (i.e. there are multiple packages containing module with given name)
 -}
 resolveUnitId :: HieDb -> ModuleName -> IO (Either HieDbErr Unit)
-resolveUnitId (getConn -> conn) mn = do
+resolveUnitId (getConnection -> conn) mn = do
   luid <- query conn "SELECT mod, unit, is_boot, hs_src, is_real, hash FROM mods WHERE mod = ? and is_boot = 0" (Only mn)
   return $ case luid of
     [] ->  Left $ NotIndexed mn Nothing
@@ -67,7 +67,7 @@ resolveUnitId (getConn -> conn) mn = do
     (x:xs) -> Left $ AmbiguousUnitId $ x :| xs
 
 findReferences :: HieDb -> Bool -> OccName -> Maybe ModuleName -> Maybe Unit -> [FilePath] -> IO [Res RefRow]
-findReferences (getConn -> conn) isReal occ mn uid exclude =
+findReferences (getConnection -> conn) isReal occ mn uid exclude =
   queryNamed conn thisQuery ([":occ" := occ, ":mod" := mn, ":unit" := uid, ":real" := isReal] ++ excludedFields)
   where
     excludedFields = zipWith (\n f -> (":exclude" <> T.pack (show n)) := f) [1 :: Int ..] exclude
@@ -80,12 +80,12 @@ findReferences (getConn -> conn) isReal occ mn uid exclude =
 
 {-| Lookup all 'HieModule' rows from 'HieDb' that are part of a given 'Unit' -}
 lookupPackage :: HieDb -> Unit -> IO [HieModuleRow]
-lookupPackage (getConn -> conn) uid =
+lookupPackage (getConnection -> conn) uid =
   query conn "SELECT * FROM mods WHERE unit = ?" (Only uid)
 
 {-| Lookup 'HieModule' row from 'HieDb' given its 'ModuleName' and 'Unit' -}
 lookupHieFile :: HieDb -> ModuleName -> Unit -> IO (Maybe HieModuleRow)
-lookupHieFile (getConn -> conn) mn uid = do
+lookupHieFile (getConnection -> conn) mn uid = do
   files <- query conn "SELECT * FROM mods WHERE mod = ? AND unit = ? AND is_boot = 0" (mn, uid)
   case files of
     [] -> return Nothing
@@ -97,7 +97,7 @@ lookupHieFile (getConn -> conn) mn uid = do
 
 {-| Lookup 'HieModule' row from 'HieDb' given the path to the Haskell source file -}
 lookupHieFileFromSource :: HieDb -> FilePath -> IO (Maybe HieModuleRow)
-lookupHieFileFromSource (getConn -> conn) fp = do
+lookupHieFileFromSource (getConnection -> conn) fp = do
   files <- query conn "SELECT * FROM mods WHERE hs_src = ?" (Only fp)
   case files of
     [] -> return Nothing
@@ -109,7 +109,7 @@ lookupHieFileFromSource (getConn -> conn) fp = do
 
 {-| Lookup 'HieModule' row from 'HieDb' given the hash of the HIE file -}
 lookupHieFileFromHash :: HieDb -> Fingerprint -> IO (Maybe HieModuleRow)
-lookupHieFileFromHash (getConn -> conn) hash = do
+lookupHieFileFromHash (getConnection -> conn) hash = do
   files <- query conn "SELECT * FROM mods WHERE hash = ?" (Only hash)
   case files of
     [] -> return Nothing
@@ -120,7 +120,7 @@ lookupHieFileFromHash (getConn -> conn) hash = do
             ++ intercalate ", " (map (show . toRow) xs)
 
 findTypeRefs :: HieDb -> Bool -> OccName -> Maybe ModuleName -> Maybe Unit -> [FilePath] -> IO [Res TypeRef]
-findTypeRefs (getConn -> conn) isReal occ mn uid exclude
+findTypeRefs (getConnection -> conn) isReal occ mn uid exclude
   = queryNamed conn thisQuery ([":occ" := occ, ":mod" := mn, ":unit" := uid, ":real" := isReal] ++ excludedFields)
   where
     excludedFields = zipWith (\n f -> (":exclude" <> T.pack (show n)) := f) [1 :: Int ..] exclude
@@ -135,7 +135,7 @@ findTypeRefs (getConn -> conn) isReal occ mn uid exclude
 
 findDef :: HieDb -> OccName -> Maybe ModuleName -> Maybe Unit -> IO [Res DefRow]
 findDef conn occ mn uid
-  = queryNamed (getConn conn) "SELECT defs.*, mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
+  = queryNamed (getConnection conn) "SELECT defs.*, mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
                               \FROM defs JOIN mods USING (hieFile) \
                               \WHERE occ = :occ AND (:mod IS NULL OR mod = :mod) AND (:unit IS NULL OR unit = :unit)"
                               [":occ" := occ,":mod" := mn, ":unit" := uid]
@@ -145,14 +145,14 @@ findOneDef = findOneVia . findDef
 
 searchDef :: HieDb -> String -> IO [Res DefRow]
 searchDef conn cs
-  = query (getConn conn) "SELECT defs.*,mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
+  = query (getConnection conn) "SELECT defs.*,mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
                          \FROM defs JOIN mods USING (hieFile) \
                          \WHERE occ LIKE ? \
                          \LIMIT 200" (Only $ '_':':':cs++"%")
 
 findDecl :: HieDb -> OccName -> Maybe ModuleName -> Maybe Unit -> IO [Res DeclRow]
 findDecl conn occ mn uid
-  = queryNamed (getConn conn) "SELECT decls.*, mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
+  = queryNamed (getConnection conn) "SELECT decls.*, mods.mod,mods.unit,mods.is_boot,mods.hs_src,mods.is_real,mods.hash \
                               \FROM decls JOIN mods USING (hieFile) \
                               \WHERE occ = :occ AND (:mod IS NULL OR mod = :mod) AND (:unit IS NULL OR unit = :unit)"
                               [":occ" := occ,":mod" := mn, ":unit" := uid]
@@ -245,7 +245,7 @@ pruneToCallersOf v g = induce (`elem` vs) g
   vs = reachable (transpose g) v
 
 getGraph :: HieDb -> IO (AdjacencyMap Vertex)
-getGraph (getConn -> conn) = do
+getGraph (getConnection -> conn) = do
   es <-
     query_ conn "SELECT  mods.mod,    decls.hieFile,    decls.occ,    decls.sl,    decls.sc,    decls.el,    decls.ec, \
                        \rmods.mod, ref_decl.hieFile, ref_decl.occ, ref_decl.sl, ref_decl.sc, ref_decl.el, ref_decl.ec \
@@ -261,7 +261,7 @@ getGraph (getConn -> conn) = do
   return $ overlay ( vertices vs ) ( edges ( map (\( x :. y ) -> ( x, y )) es ) )
 
 getVertices :: HieDb -> [Symbol] -> IO [Vertex]
-getVertices (getConn -> conn) ss = Set.toList <$> foldM f Set.empty ss
+getVertices (getConnection -> conn) ss = Set.toList <$> foldM f Set.empty ss
   where
     f :: Set Vertex -> Symbol -> IO (Set Vertex)
     f vs s = foldl' (flip Set.insert) vs <$> one s
